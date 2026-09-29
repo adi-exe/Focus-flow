@@ -23,6 +23,7 @@
   let activeTab = 'focus';
   let openLogExercise = null;
   let editTimerId = null;
+  let fullscreenTimerId = null;
   let toastTimer;
 
   function load() {
@@ -71,10 +72,12 @@
           <section class="screen ${activeTab==='exercise'?'active':''}" id="exercise-screen">${renderExercise()}</section>
         </main>
         <div id="modal-root"></div>
+        <div id="fullscreen-timer-root"></div>
         <div class="toast" id="toast"></div>
       </div>`;
     bind();
     registerSW();
+    bindFullscreenEscape();
   }
 
   function dateHeader() {
@@ -234,6 +237,9 @@
     if (action==='save-reps' && exRow) saveReps(exRow.dataset.exercise, exRow.querySelector('.rep-input')?.value);
     if (action==='cancel-modal') closeModal();
     if (action==='save-edit') saveEdit();
+    if (action==='close-fullscreen-timer') closeFullscreenTimer();
+    if (action==='fullscreen-toggle-timer' && fullscreenTimerId) toggleTimerFromFullscreen(fullscreenTimerId);
+    if (action==='fullscreen-done' && fullscreenTimerId) doneFromFullscreen(fullscreenTimerId);
   }
 
   function addBatch() {
@@ -258,17 +264,99 @@
       const remaining = Math.max(0, Math.ceil((t.endAt-Date.now())/1000));
       t.remainingAtPause = remaining * 1000;
       t.endAt = null;
-      toast('Timer paused');
+      save();
+      if (fullscreenTimerId===id) renderFullscreenTimer();
+      else { render(); toast('Timer paused'); }
     } else {
       const ms = t.remainingAtPause || Number(t.minutes)*60000;
       if (ms > 0) {
         t.endAt = Date.now() + ms;
         t.remainingAtPause = null;
+        save();
+        render();
+        openFullscreenTimer(id);
         toast('Timer started');
       }
     }
-    save(); render();
   }
+
+  function toggleTimerFromFullscreen(id) {
+    const t=findTimer(id); if(!t || t.done) return;
+    toggleTimer(id);
+  }
+
+  function doneFromFullscreen(id) {
+    const t=findTimer(id); if(!t) return;
+    if (!t.done) {
+      t.done=true;
+      t.endAt=null;
+      t.remainingAtPause=null;
+      save();
+    }
+    closeFullscreenTimer();
+    render();
+    toast('Marked done');
+  }
+
+  function openFullscreenTimer(id) {
+    fullscreenTimerId=id;
+    renderFullscreenTimer();
+    document.body.classList.add('fullscreen-timer-open');
+    const el=document.documentElement;
+    if (document.fullscreenEnabled && el.requestFullscreen) {
+      el.requestFullscreen().catch(()=>{});
+    }
+  }
+
+  function renderFullscreenTimer() {
+    const t=fullscreenTimerId ? findTimer(fullscreenTimerId) : null;
+    const root=document.querySelector('#fullscreen-timer-root');
+    if(!root || !t) return;
+    const remaining = t.endAt ? Math.max(0, Math.ceil((t.endAt-Date.now())/1000)) : (t.remainingAtPause ? Math.ceil(t.remainingAtPause/1000) : Number(t.minutes)*60);
+    const running = !!t.endAt && remaining>0 && !t.done;
+    const ended = !t.done && !running && remaining<=0;
+    root.innerHTML = `
+      <div class="fullscreen-timer" role="dialog" aria-modal="true" aria-label="Full screen study timer">
+        <div class="fullscreen-timer-top">
+          <div>
+            <div class="fullscreen-timer-label">FOCUS SESSION</div>
+            <h2>${esc(t.title || 'Study session')}</h2>
+          </div>
+          <button class="btn small ghost fullscreen-close" data-action="close-fullscreen-timer" aria-label="Close timer">✕</button>
+        </div>
+        <div class="fullscreen-timer-center">
+          <div class="fullscreen-countdown ${ended?'ended':''}" id="fullscreen-countdown">${ended?'00:00':fmtClock(remaining)}</div>
+          <div class="fullscreen-status">${t.done?'Completed':running?'Running':ended?'Time up':'Paused'}</div>
+        </div>
+        <div class="fullscreen-timer-actions">
+          ${t.done ? '' : `<button class="btn primary fullscreen-main-btn" data-action="fullscreen-toggle-timer">${running?'Pause':'Start'}</button>`}
+          ${t.done ? '' : `<button class="btn fullscreen-main-btn" data-action="fullscreen-done">Done</button>`}
+        </div>
+        <div class="fullscreen-timer-note">You can close this view and the timer will keep running.</div>
+      </div>`;
+    root.querySelectorAll('[data-action]').forEach(el=>el.addEventListener('click', handle));
+  }
+
+  function closeFullscreenTimer() {
+    fullscreenTimerId=null;
+    document.body.classList.remove('fullscreen-timer-open');
+    const root=document.querySelector('#fullscreen-timer-root');
+    if(root) root.innerHTML='';
+    if(document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(()=>{});
+  }
+
+  function bindFullscreenEscape() {
+    document.onkeydown = (e) => {
+      if(e.key==='Escape' && fullscreenTimerId) closeFullscreenTimer();
+    };
+    document.addEventListener('fullscreenchange', ()=>{
+      if(!document.fullscreenElement && fullscreenTimerId) {
+        // Keep the in-app full-screen timer overlay available even if browser fullscreen is exited.
+        document.body.classList.add('fullscreen-timer-open');
+      }
+    }, {once:true});
+  }
+
   function deleteTimer(id) {
     day().timers = day().timers.filter(t=>t.id!==id); save(); render(); toast('Timer deleted');
   }
@@ -309,9 +397,32 @@
     let changed=false;
     document.querySelectorAll('[data-countdown]').forEach(el=>{
       const t=findTimer(el.dataset.countdown); if(!t || t.done) return;
-      if(t.endAt){ const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000)); el.textContent=fmtClock(secs); if(secs===0){ t.endAt=null; changed=true; } }
+      if(t.endAt){
+        const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000));
+        el.textContent=fmtClock(secs);
+        if(secs===0){ t.endAt=null; changed=true; }
+      }
     });
-    if(changed){ save(); render(); }
+    if(fullscreenTimerId){
+      const t=findTimer(fullscreenTimerId);
+      if(t){
+        const cd=document.querySelector('#fullscreen-countdown');
+        const status=document.querySelector('.fullscreen-status');
+        if(t.done){
+          if(cd) cd.textContent='Done';
+          if(status) status.textContent='Completed';
+        } else if(t.endAt){
+          const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000));
+          if(cd) cd.textContent=fmtClock(secs);
+          if(status) status.textContent=secs>0?'Running':'Time up';
+          if(secs===0){ t.endAt=null; changed=true; renderFullscreenTimer(); }
+        } else if(t.remainingAtPause){
+          if(cd) cd.textContent=fmtClock(Math.ceil(t.remainingAtPause/1000));
+          if(status) status.textContent='Paused';
+        }
+      }
+    }
+    if(changed){ save(); render(); if(fullscreenTimerId) renderFullscreenTimer(); }
   }
   setInterval(updateCountdowns,1000);
 

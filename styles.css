@@ -101,6 +101,26 @@ main { max-width: 1080px; margin: 0 auto; padding: 22px 20px 48px; }
 .modal p { margin:0 0 16px; color:var(--muted); font-size:13px; }
 .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
 .hidden { display:none !important; }
+
+body.fullscreen-timer-open { overflow:hidden; }
+.fullscreen-timer { position:fixed; inset:0; z-index:200; min-height:100svh; display:flex; flex-direction:column; justify-content:space-between; padding:clamp(22px,5vw,56px); background:radial-gradient(circle at 50% 20%, #1a2430 0, #0b0e13 48%, #07090c 100%); color:var(--text); }
+.fullscreen-timer-top { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; width:min(900px,100%); margin:0 auto; }
+.fullscreen-timer-label { color:var(--muted); font-size:11px; font-weight:800; letter-spacing:.18em; }
+.fullscreen-timer-top h2 { margin:6px 0 0; font-size:clamp(22px,4vw,34px); letter-spacing:-.03em; }
+.fullscreen-close { min-width:42px; min-height:42px; font-size:18px; }
+.fullscreen-timer-center { flex:1; display:grid; place-items:center; text-align:center; padding:10px 0; }
+.fullscreen-countdown { font-variant-numeric:tabular-nums; font-weight:900; letter-spacing:-.06em; line-height:.95; font-size:clamp(88px,22vw,240px); color:var(--accent); text-shadow:0 0 40px rgba(183,255,92,.10); }
+.fullscreen-countdown.ended { color:#ffd36b; }
+.fullscreen-status { margin-top:22px; color:var(--muted); font-size:16px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+.fullscreen-timer-actions { display:flex; justify-content:center; align-items:center; gap:12px; width:min(620px,100%); margin:0 auto; }
+.fullscreen-main-btn { min-width:160px; min-height:54px; font-size:15px; }
+.fullscreen-timer-note { width:min(900px,100%); margin:22px auto 0; text-align:center; color:var(--muted); font-size:12px; }
+@media (max-width:620px) {
+  .fullscreen-timer { padding:20px 16px 24px; }
+  .fullscreen-timer-actions { flex-direction:column; }
+  .fullscreen-main-btn { width:100%; }
+}
+
 @media (max-width: 860px) {
   .span-8,.span-4,.span-6 { grid-column: span 12; }
 }
