@@ -25,6 +25,7 @@
   let editTimerId = null;
   let fullscreenTimerId = null;
   let toastTimer;
+  let deferredInstallPrompt = null;
 
   function load() {
     try {
@@ -51,6 +52,18 @@
   function dateShift(delta) {
     const d = parseKey(selectedDate); d.setDate(d.getDate()+delta); selectedDate = localDateKey(d); render();
   }
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    refreshInstallButton();
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    refreshInstallButton();
+    toast('FocusFlow installed');
+  });
+
   function render() {
     document.querySelector('#app').innerHTML = `
       <div class="app-shell">
@@ -60,7 +73,7 @@
               <div class="brand-mark">FF</div>
               <div><h1>FocusFlow</h1><p>Study + workout log</p></div>
             </div>
-            <button class="btn small ghost" data-action="today">Today</button>
+            <div class="topbar-actions"><button class="btn small install-btn" data-action="install-app">Install App</button><button class="btn small ghost" data-action="today">Today</button></div>
           </div>
           <nav class="tabs">
             <button class="tab ${activeTab==='focus'?'active':''}" data-tab="focus">Focus</button>
@@ -78,6 +91,7 @@
     bind();
     registerSW();
     bindFullscreenEscape();
+    refreshInstallButton();
   }
 
   function dateHeader() {
@@ -222,6 +236,7 @@
     const action = e.currentTarget.dataset.action;
     const row = e.currentTarget.closest('[data-id]');
     const exRow = e.currentTarget.closest('[data-exercise]');
+    if (action==='install-app') installApp();
     if (action==='today') { selectedDate=todayKey(); render(); }
     if (action==='prev-date') dateShift(-1);
     if (action==='next-date') dateShift(1);
@@ -355,6 +370,34 @@
         document.body.classList.add('fullscreen-timer-open');
       }
     }, {once:true});
+  }
+
+
+  function refreshInstallButton() {
+    const btn = document.querySelector('[data-action=\"install-app\"]');
+    if (!btn) return;
+    const standalone = window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone;
+    if (standalone) {
+      btn.textContent = 'Installed';
+      btn.disabled = true;
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = deferredInstallPrompt ? 'Install App' : 'Get App';
+  }
+
+  async function installApp() {
+    const standalone = window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone;
+    if (standalone) return toast('FocusFlow is already installed');
+    if (!deferredInstallPrompt) {
+      toast('Use Chrome menu ⋮ → Install app / Add to Home screen');
+      return;
+    }
+    deferredInstallPrompt.prompt();
+    const result = await deferredInstallPrompt.userChoice;
+    if (result?.outcome === 'accepted') toast('Installing FocusFlow…');
+    deferredInstallPrompt = null;
+    refreshInstallButton();
   }
 
   function deleteTimer(id) {

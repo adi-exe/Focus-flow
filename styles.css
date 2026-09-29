@@ -21,6 +21,9 @@ button { cursor: pointer; }
 .app-shell { min-height: 100vh; }
 .topbar { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(16px); background: rgba(11,14,19,.82); border-bottom: 1px solid rgba(255,255,255,.05); }
 .topbar-inner { max-width: 1080px; margin: 0 auto; padding: 18px 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.topbar-actions { display:flex; align-items:center; gap:8px; }
+.install-btn { border-color: rgba(183,255,92,.45); color: var(--accent); background: rgba(183,255,92,.07); }
+.install-btn:disabled { opacity:.65; cursor:default; transform:none; }
 .brand { display: flex; align-items: center; gap: 12px; }
 .brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; border: 1px solid #36404f; background: #161c25; color: var(--accent); font-weight: 900; }
 .brand h1 { font-size: 18px; margin: 0; letter-spacing: -.02em; }
@@ -126,6 +129,7 @@ body.fullscreen-timer-open { overflow:hidden; }
 }
 @media (max-width: 620px) {
   .topbar-inner { padding:14px 14px; }
+  .topbar-actions { gap:6px; }
   .tabs, main { padding-left:14px; padding-right:14px; }
   .add-timers { grid-template-columns:1fr; }
   .timer-row { grid-template-columns:auto 1fr; }
