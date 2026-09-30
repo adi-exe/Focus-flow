@@ -1,4 +1,4 @@
-const CACHE = 'focusflow-v3';
+const CACHE = 'focusflow-v4';
 const ASSETS = [
   './',
   './index.html',
@@ -27,4 +27,28 @@ self.addEventListener('fetch', (event) => {
       return response;
     }).catch(() => caches.match('./index.html')))
   );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  const notification = event.notification;
+  const data = notification.data || {};
+  notification.close();
+
+  event.waitUntil((async () => {
+    const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const target = clientList[0];
+
+    if (target) {
+      await target.focus();
+      target.postMessage({
+        type: 'focusflow-notification-action',
+        action: event.action === 'done' ? 'done' : 'open',
+        timerId: data.timerId,
+        dateKey: data.dateKey
+      });
+      return;
+    }
+
+    await self.clients.openWindow('./');
+  })());
 });

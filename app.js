@@ -26,6 +26,11 @@
   let fullscreenTimerId = null;
   let toastTimer;
   let deferredInstallPrompt = null;
+  let audioContext = null;
+  let lastNotificationTick = {};
+  let completionTimeouts = {};
+  const NOTIFICATION_REFRESH_SECONDS = 15;
+  const TIMER_NOTIFICATION_TAG_PREFIX = 'focusflow-timer-';
 
   function load() {
     try {
@@ -227,6 +232,162 @@
     return `<div class="rep-history">${rows.map(r=>`<div class="rep-row"><span>${esc(names[r.exerciseId]||'Deleted exercise')} · ${new Date(r.ts).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})}</span><strong>+${r.count}</strong></div>`).join('')}</div>`;
   }
 
+  function ensureAudioReady() {
+    try {
+      if (!audioContext) {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (AudioCtx) audioContext = new AudioCtx();
+      }
+      if (audioContext?.state === 'suspended') audioContext.resume().catch(() => {});
+    } catch {}
+  }
+
+  async function requestNotificationPermission() {
+    if (!('Notification' in window)) return 'unsupported';
+    try {
+      if (Notification.permission === 'default') return await Notification.requestPermission();
+      return Notification.permission;
+    } catch {
+      return 'unsupported';
+    }
+  }
+
+  async function showAppNotification(title, options = {}) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      await registration.showNotification(title, options);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function timerNotificationTag(t) {
+    return `${TIMER_NOTIFICATION_TAG_PREFIX}${t.id}`;
+  }
+
+  async function closeTimerNotification(t) {
+    if (!t || !('serviceWorker' in navigator)) return;
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const notifications = await registration.getNotifications({ tag: timerNotificationTag(t) });
+      notifications.forEach(n => n.close());
+    } catch {}
+  }
+
+  async function showTimerNotification(t, completed = false) {
+    if (!t) return;
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const remaining = t.endAt ? Math.max(0, Math.ceil((t.endAt - Date.now()) / 1000)) : 0;
+    const tag = timerNotificationTag(t);
+    await showAppNotification(
+      completed ? 'FocusFlow — Session complete' : 'FocusFlow — Study timer running',
+      {
+        body: completed
+          ? `${t.title || 'Study session'} is complete. It has been marked done automatically.`
+          : `${t.title || 'Study session'} • ${fmtClock(remaining)} remaining`,
+        tag,
+        renotify: completed,
+        requireInteraction: true,
+        icon: './icon.svg',
+        badge: './icon.svg',
+        vibrate: completed ? [160, 80, 160, 80, 320] : [80],
+        timestamp: Date.now(),
+        data: { type: 'timer', timerId: t.id, dateKey: t.dayKey || selectedDate, completed },
+        actions: completed ? [{ action: 'open', title: 'Open FocusFlow' }] : [
+          { action: 'done', title: 'Mark done' },
+          { action: 'open', title: 'Open timer' }
+        ]
+      }
+    );
+  }
+
+  function playCompletionChime() {
+    try {
+      ensureAudioReady();
+      if (!audioContext) return;
+      const notes = [659.25, 783.99, 987.77, 783.99, 659.25, 987.77, 783.99];
+      const start = audioContext.currentTime + 0.05;
+      const total = 4.9;
+      notes.forEach((freq, i) => {
+        const when = start + Math.min(total - 0.7, i * 0.7);
+        const osc = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, when);
+        gain.gain.setValueAtTime(0.0001, when);
+        gain.gain.exponentialRampToValueAtTime(0.18, when + 0.04);
+        gain.gain.exponentialRampToValueAtTime(0.0001, when + 0.62);
+        osc.connect(gain).connect(audioContext.destination);
+        osc.start(when);
+        osc.stop(when + 0.66);
+      });
+    } catch {}
+  }
+
+  function scheduleTimerCompletion(t) {
+    if (!t?.endAt) return;
+    clearTimeout(completionTimeouts[t.id]);
+    const delay = Math.max(0, t.endAt - Date.now() + 100);
+    completionTimeouts[t.id] = setTimeout(() => {
+      const latest = findTimerAcrossDays(t.id, t.dayKey || selectedDate);
+      if (latest?.endAt && latest.endAt <= Date.now() && !latest.done) completeTimer(latest);
+    }, delay);
+  }
+
+  function findTimerAcrossDays(id, dateKey) {
+    if (dateKey && data.days[dateKey]) {
+      const match = data.days[dateKey].timers.find(x => x.id === id);
+      if (match) return match;
+    }
+    for (const d of Object.values(data.days)) {
+      const match = d.timers.find(x => x.id === id);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  async function completeTimer(t) {
+    if (!t || t.done) return false;
+    clearTimeout(completionTimeouts[t.id]);
+    delete completionTimeouts[t.id];
+    t.done = true;
+    t.endAt = null;
+    t.remainingAtPause = null;
+    save();
+    playCompletionChime();
+    await showTimerNotification(t, true);
+    lastNotificationTick[t.id] = null;
+    const wasFullscreen = fullscreenTimerId === t.id;
+    render();
+    if (wasFullscreen) renderFullscreenTimer();
+    toast(`${t.title || 'Study session'} complete`);
+    return true;
+  }
+
+  async function handleNotificationAction(message) {
+    if (!message?.timerId || !message?.dateKey) return;
+    const d = day(message.dateKey);
+    const t = d.timers.find(x => x.id === message.timerId);
+    if (!t) return;
+    selectedDate = message.dateKey;
+    if (message.action === 'done') {
+      if (!t.done) {
+        t.done = true;
+        t.endAt = null;
+        t.remainingAtPause = null;
+        save();
+      }
+      closeTimerNotification(t);
+      render();
+      toast('Marked done from notification');
+    } else {
+      render();
+      openFullscreenTimer(t.id);
+    }
+  }
+
   function bind() {
     document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{activeTab=b.dataset.tab;openLogExercise=null;render();});
     document.querySelectorAll('[data-action]').forEach(el=>el.addEventListener('click', handle));
@@ -262,7 +423,7 @@
     const minutes = Math.min(1440, Math.max(1, Number(document.querySelector('#timer-minutes')?.value || 30)));
     const d = day();
     const startIndex = d.timers.length;
-    for (let i=0;i<count;i++) d.timers.push({id:uid(),title:`Study ${startIndex+i+1}`,minutes,done:false,endAt:null});
+    for (let i=0;i<count;i++) d.timers.push({id:uid(),title:`Study ${startIndex+i+1}`,minutes,done:false,endAt:null,dayKey:selectedDate});
     save(); render(); toast(`${count} timer${count>1?'s':''} added`);
   }
 
@@ -270,26 +431,40 @@
   function toggleDone(id) {
     const t=findTimer(id); if(!t) return;
     if (t.done) { t.done=false; }
-    else { t.done=true; t.endAt=null; }
+    else {
+      t.done=true; t.endAt=null; t.remainingAtPause=null;
+      clearTimeout(completionTimeouts[t.id]);
+      delete completionTimeouts[t.id];
+      closeTimerNotification(t);
+    }
     save(); render(); toast(t.done?'Marked done':'Marked undone');
   }
-  function toggleTimer(id) {
+  async function toggleTimer(id) {
     const t=findTimer(id); if(!t || t.done) return;
     if (t.endAt) {
       const remaining = Math.max(0, Math.ceil((t.endAt-Date.now())/1000));
       t.remainingAtPause = remaining * 1000;
       t.endAt = null;
       save();
+      await closeTimerNotification(t);
+      clearTimeout(completionTimeouts[t.id]);
+      delete completionTimeouts[t.id];
       if (fullscreenTimerId===id) renderFullscreenTimer();
       else { render(); toast('Timer paused'); }
     } else {
       const ms = t.remainingAtPause || Number(t.minutes)*60000;
       if (ms > 0) {
+        ensureAudioReady();
+        await requestNotificationPermission();
+        t.dayKey = t.dayKey || selectedDate;
         t.endAt = Date.now() + ms;
         t.remainingAtPause = null;
         save();
+        scheduleTimerCompletion(t);
         render();
         openFullscreenTimer(id);
+        showTimerNotification(t, false);
+        lastNotificationTick[t.id] = Math.floor((ms / 1000) / NOTIFICATION_REFRESH_SECONDS);
         toast('Timer started');
       }
     }
@@ -300,7 +475,7 @@
     toggleTimer(id);
   }
 
-  function doneFromFullscreen(id) {
+  async function doneFromFullscreen(id) {
     const t=findTimer(id); if(!t) return;
     if (!t.done) {
       t.done=true;
@@ -308,6 +483,7 @@
       t.remainingAtPause=null;
       save();
     }
+    await closeTimerNotification(t);
     closeFullscreenTimer();
     render();
     toast('Marked done');
@@ -438,14 +614,25 @@
   function updateCountdowns() {
     if (activeTab!=='focus') return;
     let changed=false;
+    const completedTimers=[];
+
     document.querySelectorAll('[data-countdown]').forEach(el=>{
       const t=findTimer(el.dataset.countdown); if(!t || t.done) return;
       if(t.endAt){
         const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000));
         el.textContent=fmtClock(secs);
-        if(secs===0){ t.endAt=null; changed=true; }
+        if(secs===0){ completedTimers.push(t); }
+        else {
+          const tick = Math.floor(secs / NOTIFICATION_REFRESH_SECONDS);
+          if ('Notification' in window && Notification.permission === 'granted' && lastNotificationTick[t.id] !== tick) {
+            lastNotificationTick[t.id] = tick;
+            if (tick >= 0) showTimerNotification(t, false);
+            scheduleTimerCompletion(t);
+          }
+        }
       }
     });
+
     if(fullscreenTimerId){
       const t=findTimer(fullscreenTimerId);
       if(t){
@@ -458,21 +645,45 @@
           const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000));
           if(cd) cd.textContent=fmtClock(secs);
           if(status) status.textContent=secs>0?'Running':'Time up';
-          if(secs===0){ t.endAt=null; changed=true; renderFullscreenTimer(); }
+          if(secs===0 && !completedTimers.some(x=>x.id===t.id)) completedTimers.push(t);
         } else if(t.remainingAtPause){
           if(cd) cd.textContent=fmtClock(Math.ceil(t.remainingAtPause/1000));
           if(status) status.textContent='Paused';
         }
       }
     }
-    if(changed){ save(); render(); if(fullscreenTimerId) renderFullscreenTimer(); }
+
+    if(completedTimers.length){
+      // Complete each timer once. The promise chain keeps rapid completions from racing renders.
+      completedTimers.forEach(t => { if (!t.done) completeTimer(t); });
+      changed=true;
+    }
+
+    if(changed) save();
   }
   setInterval(updateCountdowns,1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) updateCountdowns(); });
 
   function toast(msg) {
     const el=document.querySelector('#toast'); if(!el) return; clearTimeout(toastTimer); el.textContent=msg; el.classList.add('show'); toastTimer=setTimeout(()=>el.classList.remove('show'),1800);
   }
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      if (event.data?.type === 'focusflow-notification-action') handleNotificationAction(event.data);
+    });
+  }
+
   function registerSW() { if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{}); }
 
+  function resumeTimerSchedules() {
+    Object.entries(data.days).forEach(([dateKey, d]) => {
+      d.timers.filter(t => t.endAt && !t.done).forEach(t => {
+        t.dayKey = t.dayKey || dateKey;
+        scheduleTimerCompletion(t);
+      });
+    });
+  }
+
   render();
+  resumeTimerSchedules();
 })();

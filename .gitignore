@@ -1,0 +1,9 @@
+.DS_Store
+node_modules/
+*.iml
+.gradle/
+/local.properties
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
