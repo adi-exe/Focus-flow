@@ -24,12 +24,16 @@
   let openLogExercise = null;
   let editTimerId = null;
   let fullscreenTimerId = null;
+  const FULLSCREEN_STATE_KEY = 'focusflow-fullscreen-timer-id';
   let toastTimer;
   let deferredInstallPrompt = null;
   let audioContext = null;
   let lastNotificationTick = {};
+  let notificationSyncBusy = false;
+  let notificationSyncQueued = false;
+  let fullscreenEventsBound = false;
   let completionTimeouts = {};
-  const NOTIFICATION_REFRESH_SECONDS = 15;
+  const NOTIFICATION_REFRESH_SECONDS = 1;
   const TIMER_NOTIFICATION_TAG_PREFIX = 'focusflow-timer-';
 
   function load() {
@@ -41,6 +45,44 @@
   }
   function save() { localStorage.setItem(KEY, JSON.stringify(data)); }
   function day(key=selectedDate) { if (!data.days[key]) data.days[key] = blankDay(); return data.days[key]; }
+
+  function rememberFullscreenTimer(id) {
+    try { sessionStorage.setItem(FULLSCREEN_STATE_KEY, id); } catch {}
+  }
+  function forgetFullscreenTimer() {
+    try { sessionStorage.removeItem(FULLSCREEN_STATE_KEY); } catch {}
+  }
+  function rememberedFullscreenTimerId() {
+    try { return sessionStorage.getItem(FULLSCREEN_STATE_KEY); } catch { return null; }
+  }
+  function getRunningTimers() {
+    const running = [];
+    Object.entries(data.days).forEach(([dateKey, d]) => {
+      d.timers.forEach(t => {
+        if (t.endAt && !t.done) {
+          t.dayKey = t.dayKey || dateKey;
+          running.push(t);
+        }
+      });
+    });
+    return running;
+  }
+  function firstRunningTimer() {
+    return getRunningTimers().sort((a,b) => Number(a.endAt) - Number(b.endAt))[0] || null;
+  }
+  function restoreFullscreenTimer() {
+    const id = rememberedFullscreenTimerId();
+    if (!id) return;
+    const t = findTimerAcrossDays(id, selectedDate);
+    if (!t || t.done || !t.endAt || t.endAt <= Date.now()) {
+      forgetFullscreenTimer();
+      return;
+    }
+    selectedDate = t.dayKey || selectedDate;
+    fullscreenTimerId = t.id;
+    renderFullscreenTimer();
+    document.body.classList.add('fullscreen-timer-open');
+  }
 
   function seedWelcome() {
     if (!localStorage.getItem(KEY)) {
@@ -126,6 +168,7 @@
             <button class="btn primary" data-action="add-batch">+ Add timers</button>
           </div>
           <div style="height:14px"></div>
+          ${renderActiveTimerCard()}
           <div class="timer-list">
             ${d.timers.length ? d.timers.map(renderTimer).join('') : `<div class="empty">No timers for this day yet.<br>Add a batch above.</div>`}
           </div>
@@ -154,6 +197,17 @@
       </div>`;
   }
 
+  function renderActiveTimerCard() {
+    const running = getRunningTimers();
+    if (!running.length) return '';
+    const t = running.slice().sort((a,b) => Number(a.endAt) - Number(b.endAt))[0];
+    const remaining = Math.max(0, Math.ceil((t.endAt - Date.now()) / 1000));
+    return `<div class="active-timer-card">
+      <div><small>ACTIVE TIMER</small><strong>${esc(t.title || 'Study session')}</strong><span>${fmtClock(remaining)} remaining</span></div>
+      <button class="btn small primary" data-action="open-timer" data-timer-id="${t.id}">Open timer</button>
+    </div>`;
+  }
+
   function renderTimer(t) {
     const remaining = t.endAt ? Math.max(0, Math.ceil((t.endAt-Date.now())/1000)) : null;
     const running = !!t.endAt && remaining > 0 && !t.done;
@@ -165,7 +219,7 @@
         <div class="timer-meta"><span class="countdown" data-countdown="${t.id}">${t.done?'done': t.endAt ? fmtClock(remaining) : (t.remainingAtPause ? fmtClock(Math.ceil(t.remainingAtPause/1000)) : `${t.minutes} min`)}</span> · ${t.minutes} planned minutes</div>
       </div>
       <div class="timer-actions">
-        ${t.done ? `<button class="btn small" data-action="toggle-done">Undo</button>` : `<button class="btn small" data-action="toggle-timer">${running?'Pause':'Start'}</button><button class="btn small" data-action="toggle-done">Done</button>`}
+        ${t.done ? `<button class="btn small" data-action="toggle-done">Undo</button>` : `${running ? `<button class="btn small primary" data-action="open-timer">Open</button>` : ''}<button class="btn small" data-action="toggle-timer">${running?'Pause':'Start'}</button><button class="btn small" data-action="toggle-done">Done</button>`}
         <button class="btn small" data-action="edit-timer">Edit</button>
         <button class="btn small danger" data-action="delete-timer">Delete</button>
       </div>
@@ -290,9 +344,10 @@
         tag,
         renotify: completed,
         requireInteraction: true,
+        silent: !completed,
         icon: './icon.svg',
         badge: './icon.svg',
-        vibrate: completed ? [160, 80, 160, 80, 320] : [80],
+        vibrate: completed ? [160, 80, 160, 80, 320] : undefined,
         timestamp: Date.now(),
         data: { type: 'timer', timerId: t.id, dateKey: t.dayKey || selectedDate, completed },
         actions: completed ? [{ action: 'open', title: 'Open FocusFlow' }] : [
@@ -301,6 +356,34 @@
         ]
       }
     );
+  }
+
+  async function syncRunningTimerNotifications(force = false) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    if (notificationSyncBusy) {
+      notificationSyncQueued = true;
+      return;
+    }
+    notificationSyncBusy = true;
+    try {
+      do {
+        notificationSyncQueued = false;
+        const running = getRunningTimers();
+        for (const t of running) {
+          const secs = Math.max(0, Math.ceil((t.endAt - Date.now()) / 1000));
+          if (secs <= 0) {
+            await completeTimer(t);
+            continue;
+          }
+          if (force || lastNotificationTick[t.id] !== secs) {
+            lastNotificationTick[t.id] = secs;
+            await showTimerNotification(t, false);
+          }
+        }
+      } while (notificationSyncQueued);
+    } finally {
+      notificationSyncBusy = false;
+    }
   }
 
   function playCompletionChime() {
@@ -357,11 +440,18 @@
     t.remainingAtPause = null;
     save();
     playCompletionChime();
+    await closeTimerNotification(t);
     await showTimerNotification(t, true);
     lastNotificationTick[t.id] = null;
     const wasFullscreen = fullscreenTimerId === t.id;
+    if (wasFullscreen) forgetFullscreenTimer();
     render();
-    if (wasFullscreen) renderFullscreenTimer();
+    if (wasFullscreen) {
+      fullscreenTimerId = t.id;
+      renderFullscreenTimer();
+      document.body.classList.add('fullscreen-timer-open');
+      setTimeout(() => closeFullscreenTimer(), 1200);
+    }
     toast(`${t.title || 'Study session'} complete`);
     return true;
   }
@@ -404,6 +494,7 @@
     if (action==='add-batch') addBatch();
     if (action==='toggle-done' && row) toggleDone(row.dataset.id);
     if (action==='toggle-timer' && row) toggleTimer(row.dataset.id);
+    if (action==='open-timer') openFullscreenTimer(e.currentTarget.dataset.timerId || row?.dataset.id);
     if (action==='edit-timer' && row) openEdit(row.dataset.id);
     if (action==='delete-timer' && row) deleteTimer(row.dataset.id);
     if (action==='open-date') { selectedDate=e.currentTarget.dataset.date; render(); }
@@ -427,7 +518,7 @@
     save(); render(); toast(`${count} timer${count>1?'s':''} added`);
   }
 
-  function findTimer(id) { return day().timers.find(t=>t.id===id); }
+  function findTimer(id) { return day().timers.find(t=>t.id===id) || findTimerAcrossDays(id, selectedDate); }
   function toggleDone(id) {
     const t=findTimer(id); if(!t) return;
     if (t.done) { t.done=false; }
@@ -462,9 +553,9 @@
         save();
         scheduleTimerCompletion(t);
         render();
-        openFullscreenTimer(id);
-        showTimerNotification(t, false);
-        lastNotificationTick[t.id] = Math.floor((ms / 1000) / NOTIFICATION_REFRESH_SECONDS);
+        openFullscreenTimer(id, { requestNative: true });
+        lastNotificationTick[t.id] = null;
+        syncRunningTimerNotifications(true);
         toast('Timer started');
       }
     }
@@ -489,23 +580,27 @@
     toast('Marked done');
   }
 
-  function openFullscreenTimer(id) {
-    fullscreenTimerId=id;
+  function openFullscreenTimer(id, { requestNative = true } = {}) {
+    const t = findTimerAcrossDays(id, selectedDate);
+    if (!t) return;
+    selectedDate = t.dayKey || selectedDate;
+    fullscreenTimerId = id;
+    rememberFullscreenTimer(id);
     renderFullscreenTimer();
     document.body.classList.add('fullscreen-timer-open');
-    const el=document.documentElement;
-    if (document.fullscreenEnabled && el.requestFullscreen) {
-      el.requestFullscreen().catch(()=>{});
+    const el = document.documentElement;
+    if (requestNative && document.fullscreenEnabled && el.requestFullscreen && !document.fullscreenElement) {
+      el.requestFullscreen().catch(() => {});
     }
   }
 
   function renderFullscreenTimer() {
-    const t=fullscreenTimerId ? findTimer(fullscreenTimerId) : null;
-    const root=document.querySelector('#fullscreen-timer-root');
-    if(!root || !t) return;
+    const t = fullscreenTimerId ? findTimerAcrossDays(fullscreenTimerId, selectedDate) : null;
+    const root = document.querySelector('#fullscreen-timer-root');
+    if (!root || !t) return;
     const remaining = t.endAt ? Math.max(0, Math.ceil((t.endAt-Date.now())/1000)) : (t.remainingAtPause ? Math.ceil(t.remainingAtPause/1000) : Number(t.minutes)*60);
-    const running = !!t.endAt && remaining>0 && !t.done;
-    const ended = !t.done && !running && remaining<=0;
+    const running = !!t.endAt && remaining > 0 && !t.done;
+    const ended = !t.done && !running && remaining <= 0;
     root.innerHTML = `
       <div class="fullscreen-timer" role="dialog" aria-modal="true" aria-label="Full screen study timer">
         <div class="fullscreen-timer-top">
@@ -523,57 +618,34 @@
           ${t.done ? '' : `<button class="btn primary fullscreen-main-btn" data-action="fullscreen-toggle-timer">${running?'Pause':'Start'}</button>`}
           ${t.done ? '' : `<button class="btn fullscreen-main-btn" data-action="fullscreen-done">Done</button>`}
         </div>
-        <div class="fullscreen-timer-note">You can close this view and the timer will keep running.</div>
+        <div class="fullscreen-timer-note">Closing this view does not stop the timer. Use “Open” in the session list to bring it back.</div>
       </div>`;
     root.querySelectorAll('[data-action]').forEach(el=>el.addEventListener('click', handle));
   }
 
-  function closeFullscreenTimer() {
-    fullscreenTimerId=null;
+  function closeFullscreenTimer({ forget = true } = {}) {
+    fullscreenTimerId = null;
+    if (forget) forgetFullscreenTimer();
     document.body.classList.remove('fullscreen-timer-open');
-    const root=document.querySelector('#fullscreen-timer-root');
-    if(root) root.innerHTML='';
+    const root = document.querySelector('#fullscreen-timer-root');
+    if (root) root.innerHTML='';
     if(document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(()=>{});
   }
 
   function bindFullscreenEscape() {
+    if (fullscreenEventsBound) return;
+    fullscreenEventsBound = true;
     document.onkeydown = (e) => {
       if(e.key==='Escape' && fullscreenTimerId) closeFullscreenTimer();
     };
-    document.addEventListener('fullscreenchange', ()=>{
+    document.addEventListener('fullscreenchange', () => {
       if(!document.fullscreenElement && fullscreenTimerId) {
-        // Keep the in-app full-screen timer overlay available even if browser fullscreen is exited.
+        // Android/Chrome exits native fullscreen when another app comes to the foreground.
+        // Keep our in-app fullscreen overlay alive so the timer can be restored immediately.
         document.body.classList.add('fullscreen-timer-open');
+        renderFullscreenTimer();
       }
-    }, {once:true});
-  }
-
-
-  function refreshInstallButton() {
-    const btn = document.querySelector('[data-action=\"install-app\"]');
-    if (!btn) return;
-    const standalone = window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone;
-    if (standalone) {
-      btn.textContent = 'Installed';
-      btn.disabled = true;
-      return;
-    }
-    btn.disabled = false;
-    btn.textContent = deferredInstallPrompt ? 'Install App' : 'Get App';
-  }
-
-  async function installApp() {
-    const standalone = window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone;
-    if (standalone) return toast('FocusFlow is already installed');
-    if (!deferredInstallPrompt) {
-      toast('Use Chrome menu ⋮ → Install app / Add to Home screen');
-      return;
-    }
-    deferredInstallPrompt.prompt();
-    const result = await deferredInstallPrompt.userChoice;
-    if (result?.outcome === 'accepted') toast('Installing FocusFlow…');
-    deferredInstallPrompt = null;
-    refreshInstallButton();
+    });
   }
 
   function deleteTimer(id) {
@@ -612,57 +684,71 @@
   }
 
   function updateCountdowns() {
-    if (activeTab!=='focus') return;
-    let changed=false;
-    const completedTimers=[];
+    const now = Date.now();
+    let changed = false;
+    const expired = [];
 
-    document.querySelectorAll('[data-countdown]').forEach(el=>{
-      const t=findTimer(el.dataset.countdown); if(!t || t.done) return;
-      if(t.endAt){
-        const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000));
-        el.textContent=fmtClock(secs);
-        if(secs===0){ completedTimers.push(t); }
-        else {
-          const tick = Math.floor(secs / NOTIFICATION_REFRESH_SECONDS);
-          if ('Notification' in window && Notification.permission === 'granted' && lastNotificationTick[t.id] !== tick) {
-            lastNotificationTick[t.id] = tick;
-            if (tick >= 0) showTimerNotification(t, false);
-            scheduleTimerCompletion(t);
-          }
-        }
-      }
+    document.querySelectorAll('[data-countdown]').forEach(el => {
+      const t = findTimer(el.dataset.countdown);
+      if (!t || t.done || !t.endAt) return;
+      const secs = Math.max(0, Math.ceil((t.endAt-now)/1000));
+      el.textContent = fmtClock(secs);
+      if (secs <= 0) expired.push(t);
     });
 
-    if(fullscreenTimerId){
-      const t=findTimer(fullscreenTimerId);
-      if(t){
-        const cd=document.querySelector('#fullscreen-countdown');
-        const status=document.querySelector('.fullscreen-status');
-        if(t.done){
-          if(cd) cd.textContent='Done';
-          if(status) status.textContent='Completed';
-        } else if(t.endAt){
-          const secs=Math.max(0,Math.ceil((t.endAt-Date.now())/1000));
-          if(cd) cd.textContent=fmtClock(secs);
-          if(status) status.textContent=secs>0?'Running':'Time up';
-          if(secs===0 && !completedTimers.some(x=>x.id===t.id)) completedTimers.push(t);
-        } else if(t.remainingAtPause){
-          if(cd) cd.textContent=fmtClock(Math.ceil(t.remainingAtPause/1000));
-          if(status) status.textContent='Paused';
-        }
+    if (fullscreenTimerId) {
+      const t = findTimerAcrossDays(fullscreenTimerId, selectedDate);
+      const cd = document.querySelector('#fullscreen-countdown');
+      const status = document.querySelector('.fullscreen-status');
+      if (!t) {
+        closeFullscreenTimer();
+      } else if (t.done) {
+        if(cd) cd.textContent='Done';
+        if(status) status.textContent='Completed';
+      } else if (t.endAt) {
+        const secs = Math.max(0, Math.ceil((t.endAt-now)/1000));
+        if(cd) cd.textContent=fmtClock(secs);
+        if(status) status.textContent=secs>0?'Running':'Time up';
+        if (secs <= 0) expired.push(t);
+      } else if (t.remainingAtPause) {
+        if(cd) cd.textContent=fmtClock(Math.ceil(t.remainingAtPause/1000));
+        if(status) status.textContent='Paused';
       }
     }
 
-    if(completedTimers.length){
-      // Complete each timer once. The promise chain keeps rapid completions from racing renders.
-      completedTimers.forEach(t => { if (!t.done) completeTimer(t); });
-      changed=true;
+    const uniqueExpired = [...new Map(expired.map(t=>[t.id,t])).values()];
+    uniqueExpired.forEach(t => { if (!t.done) completeTimer(t); changed = true; });
+
+    if (activeTab === 'focus') {
+      const activeCard = document.querySelector('.active-timer-card');
+      if (activeCard) {
+        const t = firstRunningTimer();
+        if (t) {
+          const remaining = Math.max(0, Math.ceil((t.endAt-now)/1000));
+          const span = activeCard.querySelector('span');
+          if (span) span.textContent = `${fmtClock(remaining)} remaining`;
+        } else {
+          activeCard.remove();
+        }
+      }
     }
 
     if(changed) save();
+    syncRunningTimerNotifications(false);
   }
-  setInterval(updateCountdowns,1000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) updateCountdowns(); });
+  setInterval(updateCountdowns, 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      updateCountdowns();
+      restoreFullscreenTimer();
+      syncRunningTimerNotifications(true);
+    }
+  });
+  window.addEventListener('pageshow', () => {
+    updateCountdowns();
+    if (!document.hidden) restoreFullscreenTimer();
+    syncRunningTimerNotifications(true);
+  });
 
   function toast(msg) {
     const el=document.querySelector('#toast'); if(!el) return; clearTimeout(toastTimer); el.textContent=msg; el.classList.add('show'); toastTimer=setTimeout(()=>el.classList.remove('show'),1800);
@@ -686,4 +772,5 @@
 
   render();
   resumeTimerSchedules();
+  if (!document.hidden) restoreFullscreenTimer();
 })();
